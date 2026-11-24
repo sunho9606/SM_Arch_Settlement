@@ -307,7 +307,7 @@ def append_receipts_to_excel(
 def extract_receipt_with_gemini(
     image_bytes: bytes,
     api_key: str,
-    model_name: str = "gemini-2.5-flash",
+    model_name: str = "gemini-3.8-flash",
 ) -> ReceiptExtract:
     from google import genai
     from google.genai import types
@@ -400,11 +400,15 @@ def run_streamlit_app() -> None:
                 help="Google AI Studio(aistudio.google.com/app/apikey)에서 발급한 키를 입력하세요.",
             )
 
-        model_name = st.selectbox(
+        model_choice = st.selectbox(
             "인식 모델",
-            options=["gemini-2.5-flash", "gemini-2.5-pro"],
+            options=["gemini-3.8-flash", "gemini-3.6-flash", "직접 입력"],
             index=0,
         )
+        if model_choice == "직접 입력":
+            model_name = st.text_input("모델명 입력", value="gemini-3.8-flash").strip()
+        else:
+            model_name = model_choice
         default_user = st.selectbox(
             "기본 사용자(R열)",
             options=DEFAULT_USERS + ["직접 입력"],
