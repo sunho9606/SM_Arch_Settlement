@@ -1,8 +1,8 @@
 """
 공사 정산서 영수증 자동 입력 웹앱 (Streamlit Community Cloud / 로컬 공용)
 
-- 웹 게시 시 Streamlit Secrets에 GEMINI_API_KEY와 APP_PASSWORD를 등록하면
-  팀원들이 API 키를 입력하지 않고 공용 비밀번호만으로 안전하게 접속할 수 있습니다.
+- 연결된 API 키에서 실제로 사용 가능한 Gemini 모델 목록을 자동 조회합니다.
+- 503 혼잡 오류가 발생하면 사용 가능한 다른 모델로 자동 재시도·전환합니다.
 - 기존 정산서(.xlsx)의 서식, 병합 셀, S열 소계 및 상단 합계 수식을 그대로 유지하며,
   중복 의심 내역은 '반영' 체크를 자동 해제해 확인 후 건너뛰기/강제입력을 선택할 수 있습니다.
 """
@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import io
 import os
+import time
 from typing import Literal
 
 from openpyxl import load_workbook
@@ -54,6 +55,22 @@ CATEGORY_COL_MAP: dict[str, tuple[int | None, int]] = {
 DEFAULT_USERS = ["박경호", "윤선호", "유원오", "김용태", "조중창"]
 DATA_START_ROW = 5
 DATA_END_ROW = 104
+
+EXCLUDED_MODEL_KEYWORDS = (
+    "embedding",
+    "imagen",
+    "veo",
+    "tts",
+    "audio",
+    "live",
+    "robotics",
+    "aqa",
+    "bisect",
+    "banana",
+    "lyria",
+    "genie",
+    "decision",
+)
 
 
 class ReceiptExtract(BaseModel):
@@ -304,11 +321,51 @@ def append_receipts_to_excel(
     return out_buf.getvalue(), written_info, skipped_count
 
 
+def discover_available_models(api_key: str) -> list[str]:
+    """
+    현재 API 키로 실제 호출 가능한 Gemini 텍스트·이미지 모델 목록을 서버에서 직접 조회합니다.
+    """
+    from google import genai
+
+    client = genai.Client(api_key=api_key)
+    models: list[str] = []
+    for m in client.models.list():
+        name = (getattr(m, "name", "") or "").replace("models/", "").strip()
+        if not name or "gemini" not in name.lower():
+            continue
+        low = name.lower()
+        if any(bad in low for bad in EXCLUDED_MODEL_KEYWORDS):
+            continue
+        actions = getattr(m, "supported_actions", None) or []
+        if actions and "generateContent" not in actions:
+            continue
+        if name not in models:
+            models.append(name)
+
+    # 빠르고 혼잡이 적은 flash-lite -> flash -> 나머지 순으로 우선 정렬
+    def sort_key(n: str) -> tuple[int, str]:
+        low = n.lower()
+        if "flash-lite" in low:
+            return (0, n)
+        if "flash" in low:
+            return (1, n)
+        return (2, n)
+
+    models.sort(key=sort_key)
+    return models
+
+
 def extract_receipt_with_gemini(
     image_bytes: bytes,
     api_key: str,
-    model_name: str = "gemini-3.8-flash",
-) -> ReceiptExtract:
+    model_name: str,
+    fallback_models: list[str] | None = None,
+) -> tuple[ReceiptExtract, str]:
+    """
+    선택한 모델로 영수증을 인식하고, 503/429/404 발생 시 사용 가능한 예비 모델로 자동 전환합니다.
+    Returns:
+        (추출 결과, 실제 성공한 모델명)
+    """
     from google import genai
     from google.genai import types
     from PIL import Image, ImageOps
@@ -329,23 +386,39 @@ def extract_receipt_with_gemini(
         "- memo: 주유·주차 영수증에 차량번호가 있으면 '차량번호 주유비' 형태로 적으세요."
     )
 
-    response = client.models.generate_content(
-        model=model_name,
-        contents=[
-            types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"),
-            prompt,
-        ],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=ReceiptExtract,
-            temperature=0.0,
-        ),
-    )
-    return ReceiptExtract.model_validate_json(response.text)
+    candidates = [model_name] + [
+        m for m in (fallback_models or []) if m and m != model_name
+    ]
+    last_err: Exception | None = None
+
+    for candidate in candidates[:6]:
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=candidate,
+                    contents=[
+                        types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"),
+                        prompt,
+                    ],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=ReceiptExtract,
+                        temperature=0.0,
+                    ),
+                )
+                return ReceiptExtract.model_validate_json(response.text), candidate
+            except Exception as exc:
+                last_err = exc
+                msg = str(exc)
+                if "503" in msg or "UNAVAILABLE" in msg or "429" in msg:
+                    time.sleep(1.5)
+                    continue
+                break
+
+    raise RuntimeError(f"사용 가능한 모델 호출 실패 (마지막 오류: {last_err})")
 
 
 def _get_secret(st_module, key: str) -> str:
-    """Streamlit Secrets 또는 환경 변수에서 비밀 설정값을 안전하게 읽어옵니다."""
     try:
         if key in st_module.secrets:
             return str(st_module.secrets[key]).strip()
@@ -363,7 +436,6 @@ def run_streamlit_app() -> None:
         layout="wide",
     )
 
-    # 웹 게시용 접속 비밀번호 잠금 (Secrets에 APP_PASSWORD가 설정된 경우 활성화)
     required_password = _get_secret(st, "APP_PASSWORD")
     if required_password:
         if not st.session_state.get("authenticated", False):
@@ -384,8 +456,14 @@ def run_streamlit_app() -> None:
         "기존 시트와 중복을 대조한 뒤 원하는 건만 정산서(.xlsx)에 자동 기입합니다."
     )
 
-    # Secrets에 GEMINI_API_KEY가 등록돼 있으면 자동 사용, 없으면 사이드바 입력창 표시
     secret_api_key = _get_secret(st, "GEMINI_API_KEY")
+
+    @st.cache_data(ttl=600, show_spinner=False)
+    def cached_models(key: str) -> tuple[list[str], str]:
+        try:
+            return discover_available_models(key), ""
+        except Exception as exc:
+            return [], str(exc)
 
     with st.sidebar:
         st.header("기본 설정")
@@ -400,15 +478,21 @@ def run_streamlit_app() -> None:
                 help="Google AI Studio(aistudio.google.com/app/apikey)에서 발급한 키를 입력하세요.",
             )
 
-        model_choice = st.selectbox(
-            "인식 모델",
-            options=["gemini-3.8-flash", "gemini-3.6-flash", "직접 입력"],
-            index=0,
-        )
+        available_models: list[str] = []
+        if api_key:
+            available_models, list_err = cached_models(api_key)
+            if available_models:
+                st.caption(f"내 API 키에서 사용 가능한 모델 {len(available_models)}개 확인됨")
+            elif list_err:
+                st.warning(f"모델 목록 조회 실패: {list_err}")
+
+        model_options = (available_models if available_models else ["gemini-3.8-flash", "gemini-3.6-flash"]) + ["직접 입력"]
+        model_choice = st.selectbox("인식 모델 (자동 탐색)", options=model_options, index=0)
         if model_choice == "직접 입력":
-            model_name = st.text_input("모델명 입력", value="gemini-3.8-flash").strip()
+            model_name = st.text_input("모델명 입력", value=model_options[0]).strip()
         else:
             model_name = model_choice
+
         default_user = st.selectbox(
             "기본 사용자(R열)",
             options=DEFAULT_USERS + ["직접 입력"],
@@ -469,12 +553,17 @@ def run_streamlit_app() -> None:
         disabled=(not uploaded_images or not api_key),
     ):
         results = []
+        used_models = set()
         progress = st.progress(0.0)
         for idx, (fname, img_bytes) in enumerate(uploaded_images):
             try:
-                ext = extract_receipt_with_gemini(
-                    img_bytes, api_key=api_key, model_name=model_name
+                ext, used_model = extract_receipt_with_gemini(
+                    img_bytes,
+                    api_key=api_key,
+                    model_name=model_name,
+                    fallback_models=available_models,
                 )
+                used_models.add(used_model)
                 q_detail = ext.memo
                 if ext.category == "차량" and not q_detail:
                     q_detail = (
@@ -511,14 +600,15 @@ def run_streamlit_app() -> None:
         st.session_state["extracted_rows"] = checked_results
 
         dup_cnt = sum(1 for r in checked_results if not r["반영"])
+        model_info = f" (사용 모델: {', '.join(sorted(used_models))})" if used_models else ""
         if dup_cnt > 0:
             st.warning(
                 f"{len(checked_results)}건 중 {dup_cnt}건에서 기존 내역과 중복이 감지되어 "
-                "'반영' 체크를 해제했습니다. 그대로 놔두려면 해제 상태를 유지하고, "
+                f"'반영' 체크를 해제했습니다{model_info}. 그대로 놔두려면 해제 상태를 유지하고, "
                 "별개 지출이라 추가해야 하면 '반영'을 다시 체크하세요."
             )
-        else:
-            st.success(f"{len(checked_results)}건 인식을 완료했습니다 (중복 없음).")
+        elif checked_results:
+            st.success(f"{len(checked_results)}건 인식을 완료했습니다 (중복 없음){model_info}.")
 
     # 3단계: 검수 및 중복 선택 테이블
     if st.session_state["extracted_rows"]:
